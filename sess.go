@@ -1,6 +1,6 @@
 // The MIT License (MIT)
 //
-// # Copyright (c) 2015 xtaci
+// Copyright (c) 2015 xtaci
 //
 // Permission is hereby granted, free of charge, to any person obtaining a copy
 // of this software and associated documentation files (the "Software"), to deal
@@ -29,13 +29,14 @@
 // KCP Output      (Reliable Transport Layer)     Reader/Listener (Reception Queue)
 //   |                                               |
 //   v                                               v
-// FEC Encoding    (Forward Error Correction)     Decryption      (Data Security)
+// FEC Encoding    (Forward Error Correction)     Decryption/authentication
 //   |                                               |
 //   v                                               v
-// CRC32 Checksum  (Error Detection)              CRC32 Checksum  (Error Detection)
+// CFB: CRC32      (Error Detection)              CFB: CRC32 verification
+// AEAD: authentication                           AEAD: authentication
 //   |                                               |
 //   v                                               v
-// Encryption      (Data Security)                FEC Decoding    (Forward Error Correction)
+// Encryption      (CFB or AEAD)                  FEC Decoding    (Forward Error Correction)
 //   |                                               |
 //   v                                               v
 // TxQueue         (Transmission Queue)           KCP Input       (Reliable Transport Layer)
@@ -46,34 +47,37 @@
 package kcp
 
 import (
+	"bytes"
 	"crypto/rand"
 	"encoding/binary"
 	"hash/crc32"
 	"io"
 	"net"
+	"runtime"
 	"sync"
 	"sync/atomic"
 	"time"
 
+	"github.com/juju/ratelimit"
+	"github.com/pion/transport/v5/deadline"
 	"github.com/pkg/errors"
 	"golang.org/x/net/ipv4"
 	"golang.org/x/net/ipv6"
-	"golang.org/x/time/rate"
 )
 
 // Session-layer constants
 const (
-	// 16-bytes nonce for each packet
+	// 16-byte nonce for each packet using a legacy block cipher
 	nonceSize = 16
 
-	// 4-bytes CRC32 checksum per packet
+	// 4-byte CRC32 checksum per packet using a legacy block cipher
 	crcSize = 4
 
-	// overall crypto header size: nonce + CRC32
+	// legacy block-cipher header size: nonce + CRC32
 	cryptHeaderSize = nonceSize + crcSize
 
-	// maximum packet size (Ethernet MTU)
-	mtuLimit = 1500
+	// maximum packet size (IPv4)
+	maxPacketSize = 1472
 
 	// conversation ID field size (bytes)
 	convSize = 4
@@ -81,12 +85,11 @@ const (
 	// accept backlog: max pending connections for Listener
 	acceptBacklog = 128
 
-	// devBacklog: channel buffer size for post-processing pipeline
+	// devBacklog: maximum queued requests in the post-processing pipeline
 	devBacklog = 2048
 
-	// max latency for consecutive FEC encoding (ms).
-	// If the interval between two data packets exceeds this,
-	// parity generation is skipped.
+	// Maximum interval between consecutive FEC data packets (ms) for parity
+	// generation. If the interval meets or exceeds this, parity is skipped.
 	maxFECEncodeLatency = 500
 
 	// max number of packets batched in a single sendmmsg/writev call
@@ -106,7 +109,7 @@ func (timeoutError) Error() string   { return "timeout" }
 func (timeoutError) Timeout() bool   { return true }
 func (timeoutError) Temporary() bool { return true }
 
-// sendRequest defines a write request before encoding and transmission
+// sendRequest holds a write request before encoding and transmission.
 type sendRequest struct {
 	buffer []byte
 	oob    bool
@@ -116,7 +119,7 @@ type sendRequest struct {
 type OOBCallBackType func([]byte)
 
 type (
-	// UDPSession defines a KCP session implemented by UDP
+	// UDPSession is a KCP session over UDP.
 	UDPSession struct {
 		conn    net.PacketConn // the underlying packet connection
 		ownConn bool           // true if we created conn internally, false if provided by caller
@@ -129,22 +132,21 @@ type (
 		// kcp receiving is based on packets
 		// recvbuf turns packets into stream
 		recvbuf []byte
-		bufptr  []byte
+		input   bytes.Reader
 
 		// FEC codec
 		fecDecoder *fecDecoder
 		fecEncoder *fecEncoder
 
 		// settings
-		remote     net.Addr               // remote peer address
-		pushedFrom net.Addr               // peer pinned by pushedPacket when remote is nil
-		rd         atomic.Value           // read deadline
-		readNotify atomic.Pointer[func()] // see SetReadNotify
-		wd         atomic.Value           // write deadline
-		headerSize int                    // the header size additional to a KCP frame
-		ackNoDelay bool                   // send ack immediately for each incoming packet(testing purpose)
-		writeDelay bool                   // delay kcp.flush() for Write() for bulk transfer
-		dup        int                    // duplicate udp packets(testing purpose)
+		remote                      net.Addr // remote peer address
+		pushedFrom                  net.Addr // peer pinned by pushedPacket when remote is nil
+		readDeadline, writeDeadline *deadline.Deadline
+		readNotify                  atomic.Pointer[func()] // see SetReadNotify
+		headerSize                  int                    // the header size additional to a KCP frame
+		ackNoDelay                  bool                   // send ACKs immediately for each incoming packet (testing only)
+		writeDelay                  bool                   // delay kcp.flush() for Write() for bulk transfer
+		dup                         int                    // duplicate UDP packets (testing only)
 
 		// notifications
 		die          chan struct{} // notify current session has Closed
@@ -161,21 +163,19 @@ type (
 		socketWriteErrorOnce sync.Once
 
 		// packets waiting to be sent on wire
-		chPostProcessing chan sendRequest
-		ppRunning        atomic.Bool // queued for or served by a postProcess worker
-		ppHeld           struct {    // a batch waiting for the rate limiter
-			w     *ppWorker
-			bytes int
-			until time.Time
-		}
+		postQueue sendQueue
+		ppRunning atomic.Bool // queued for or served by a postProcess worker
+		ppSendMu  sync.Mutex
+		ppClosing bool
 
 		// platform-dependent optimizations
 		platform platform
 
-		// rate limiter (bytes per second)
-		rateLimiter atomic.Value
+		// ratelimit buckets
+		bucket atomic.Pointer[ratelimit.Bucket]
 
-		mu sync.Mutex
+		writeGate chan struct{}
+		mu        sync.Mutex
 
 		// callbackForOOB is an optional callback for handling received out-of-band (OOB) data.
 		//
@@ -197,22 +197,31 @@ type (
 	}
 )
 
-// newUDPSession create a new udp session for client or server
+// newUDPSession creates a new UDP session for a client or server.
 func newUDPSession(conv uint32, dataShards, parityShards int, l *Listener, conn net.PacketConn, ownConn bool, remote net.Addr, block BlockCrypt) *UDPSession {
 	sess := new(UDPSession)
+	sess.writeGate = make(chan struct{}, 1)
+	sess.writeGate <- struct{}{}
 	sess.die = make(chan struct{})
 	sess.chReadEvent = make(chan struct{}, 1)
 	sess.chWriteEvent = make(chan struct{}, 1)
 	sess.chSocketReadError = make(chan struct{})
 	sess.chSocketWriteError = make(chan struct{})
-	sess.chPostProcessing = make(chan sendRequest, devBacklog)
 	sess.remote = remote
 	sess.conn = conn
 	sess.ownConn = ownConn
 	sess.l = l
 	sess.block = block
-	sess.recvbuf = make([]byte, mtuLimit)
+	sess.recvbuf = make([]byte, maxPacketSize)
 	sess.initPlatform()
+
+	sess.readDeadline = deadline.New()
+	sess.writeDeadline = deadline.New()
+
+	// Stop pending timers so closed sessions do not retain deadline resources
+	// until their deadlines expire.
+	runtime.AddCleanup(sess, freeDeadline, sess.readDeadline)
+	runtime.AddCleanup(sess, freeDeadline, sess.writeDeadline)
 
 	// calculate additional header size introduced by encryption
 	switch block := sess.block.(type) {
@@ -243,11 +252,14 @@ func newUDPSession(conv uint32, dataShards, parityShards int, l *Listener, conn 
 
 			// delivery to post processing (non-blocking to avoid deadlock under lock)
 			select {
-			case sess.chPostProcessing <- sendRequest{bts, false}:
-				sess.kickPostProcess()
 			case <-sess.die:
+				defaultBufferPool.Put(bts)
 				return
 			default:
+			}
+			if sess.postQueue.push(sendRequest{bts, false}) {
+				sess.kickPostProcess()
+			} else {
 				// drop and recycle to avoid blocking; KCP will retransmit if needed
 				defaultBufferPool.Put(bts)
 			}
@@ -265,59 +277,142 @@ func newUDPSession(conv uint32, dataShards, parityShards int, l *Listener, conn 
 		} else {
 			go sess.readLoop()
 		}
-		atomic.AddUint64(&DefaultSnmp.ActiveOpens, 1)
+		DefaultSnmp.increaseActiveOpens()
 	} else {
-		atomic.AddUint64(&DefaultSnmp.PassiveOpens, 1)
+		DefaultSnmp.increasePassiveOpens()
 	}
 
 	// start per-session updater
 	sess.updateFn = sess.update
 	SystemTimedSched.Put(sess.updateFn, time.Now())
 
-	currestab := atomic.AddUint64(&DefaultSnmp.CurrEstab, 1)
-	maxconn := atomic.LoadUint64(&DefaultSnmp.MaxConn)
-	if currestab > maxconn {
-		atomic.CompareAndSwapUint64(&DefaultSnmp.MaxConn, maxconn, currestab)
-	}
+	DefaultSnmp.increaseCurrEstab()
 
 	return sess
 }
 
+// readLocked copies data that is ready into b and reports whether there was
+// any. It must be called with s.mu held.
+func (s *UDPSession) readLocked(b []byte) (int, bool) {
+	// bufptr points to the current position in recvbuf. If the previous read's
+	// buffer was too small, the remaining data is saved in bufptr for the next
+	// read.
+	if s.input.Len() > 0 {
+		n, _ := s.input.Read(b)
+		s.notifyReadIfAvailableLocked()
+		return n, true
+	}
+
+	size := s.kcp.PeekSize() // peek data size from kcp
+	if size <= 0 {
+		return 0, false
+	}
+	// If b is large enough, read directly from KCP into b without an
+	// intermediate buffer.
+	if len(b) >= size {
+		s.kcp.Recv(b)
+		s.notifyReadIfAvailableLocked()
+		return size, true
+	}
+
+	// Otherwise, read into recvbuf first, then copy to b. Grow recvbuf to fit
+	// the packet when necessary.
+	if cap(s.recvbuf) < size {
+		// recvbuf is usually sized to the maximum packet size
+		s.recvbuf = make([]byte, size)
+	}
+
+	// resize the length of recvbuf to match the data size
+	s.recvbuf = s.recvbuf[:size]
+	s.kcp.Recv(s.recvbuf)    // read data to recvbuf first
+	s.input.Reset(s.recvbuf) // pointer update
+
+	n, _ := s.input.Read(b) // copy to b
+	s.notifyReadIfAvailableLocked()
+	return n, true
+}
+
+func (s *UDPSession) read(b []byte) (n int, ok bool) {
+	s.mu.Lock()
+	n, ok = s.readLocked(b)
+	s.mu.Unlock()
+
+	if !ok {
+		return
+	}
+
+	DefaultSnmp.addBytesReceived(n)
+	return
+}
+
 // Read implements net.Conn
 func (s *UDPSession) Read(b []byte) (n int, err error) {
-	// The deadline timer is armed only when the read has to wait.
-	var timeout *time.Timer
 	for {
-		s.mu.Lock()
-		n, ok := s.readLocked(b)
-		s.mu.Unlock()
+		n, ok := s.read(b)
 		if ok {
-			atomic.AddUint64(&DefaultSnmp.BytesReceived, uint64(n))
 			return n, nil
 		}
 
-		// if it runs here, that means we have to block the call, and wait until the
-		// next data packet arrives.
-		c := armDeadline(&timeout, &s.rd)
 		select {
 		case <-s.chReadEvent:
-			stopTimer(timeout)
-		case <-c:
+		case <-s.readDeadline.Done():
 			return 0, errors.WithStack(errTimeout)
 		case <-s.chSocketReadError:
-			stopTimer(timeout)
 			return 0, s.socketReadError.Load().(error)
 		case <-s.die:
-			stopTimer(timeout)
 			return 0, errors.WithStack(io.ErrClosedPipe)
 		}
 	}
 }
 
-// Write implements net.Conn
-func (s *UDPSession) Write(b []byte) (n int, err error) { return s.WriteBuffers([][]byte{b}) }
+func (s *UDPSession) writeBuffersLocked(v [][]byte) (int, bool) {
+	// make sure write do not overflow the max sliding window on both side
+	waitsnd := s.kcp.WaitSnd()
+	if waitsnd >= int(s.kcp.snd_wnd) {
+		return 0, false
+	}
 
-// WriteBuffers write a vector of byte slices to the underlying connection
+	var n int
+	// Transmit data sequentially, keeping each packet within mss.
+	for _, b := range v {
+		n += len(b)
+		// handle each slice for packet splitting
+		for {
+			if len(b) <= int(s.kcp.mss) {
+				s.kcp.Send(b)
+				break
+			}
+
+			s.kcp.Send(b[:s.kcp.mss])
+			b = b[s.kcp.mss:]
+		}
+	}
+
+	waitsnd = s.kcp.WaitSnd()
+	if waitsnd >= int(s.kcp.snd_wnd) || !s.writeDelay {
+		// put the packets on wire immediately if the inflight window is full
+		// or if write delay is disabled (no merging of outgoing bytes),
+		// so we do not have to wait for the periodic update to uncork.
+		s.kcp.flush(IKCP_FLUSH_FULL)
+	}
+	return n, true
+}
+
+func (s *UDPSession) writeBuffers(v [][]byte) (n int, ok bool) {
+	s.mu.Lock()
+	n, ok = s.writeBuffersLocked(v)
+	s.mu.Unlock()
+
+	if !ok {
+		return
+	}
+
+	DefaultSnmp.addBytesSent(n)
+	s.writeWait(n)
+	return
+}
+
+// WriteBuffers writes a vector of byte slices to the underlying connection.
 func (s *UDPSession) WriteBuffers(v [][]byte) (n int, err error) {
 	// An empty write only reports the conn's state. It used to run a full
 	// flush, which callers that probe with Write(nil) paid on every frame.
@@ -331,11 +426,17 @@ func (s *UDPSession) WriteBuffers(v [][]byte) (n int, err error) {
 			return 0, nil
 		}
 	}
-	// The deadline timer is armed only when the write has to wait.
-	var timeout *time.Timer
+	err = s.acquireWriteGate()
+	if err != nil {
+		return 0, err
+	}
+	defer s.releaseWriteGate()
+
 	for {
-		// check for connection close and socket error
+		// check for connection close, socket error and deadline
 		select {
+		case <-s.writeDeadline.Done():
+			return 0, errors.WithStack(errTimeout)
 		case <-s.chSocketWriteError:
 			return 0, s.socketWriteError.Load().(error)
 		case <-s.die:
@@ -343,56 +444,70 @@ func (s *UDPSession) WriteBuffers(v [][]byte) (n int, err error) {
 		default:
 		}
 
-		s.mu.Lock()
-
-		// make sure write do not overflow the max sliding window on both side
-		waitsnd := s.kcp.WaitSnd()
-		if waitsnd < int(s.kcp.snd_wnd) {
-			// transmit all data sequentially, make sure every packet size is within 'mss'
-			for _, b := range v {
-				n += len(b)
-				// handle each slice for packet splitting
-				for {
-					if len(b) <= int(s.kcp.mss) {
-						s.kcp.Send(b)
-						break
-					} else {
-						s.kcp.Send(b[:s.kcp.mss])
-						b = b[s.kcp.mss:]
-					}
-				}
-			}
-
-			waitsnd = s.kcp.WaitSnd()
-			if waitsnd >= int(s.kcp.snd_wnd) || !s.writeDelay {
-				// put the packets on wire immediately if the inflight window is full
-				// or if we've specified write no delay(NO merging of outgoing bytes)
-				// we don't have to wait until the periodical update() procedure uncorks.
-				s.kcp.flush(IKCP_FLUSH_FULL)
-			}
-			s.mu.Unlock()
-			atomic.AddUint64(&DefaultSnmp.BytesSent, uint64(n))
+		n, ok := s.writeBuffers(v)
+		if ok {
 			return n, nil
 		}
 
-		s.mu.Unlock()
-
-		// if it runs here, that means we have to block the call, and wait until the
-		// transmit buffer to become available again.
-		c := armDeadline(&timeout, &s.wd)
 		select {
 		case <-s.chWriteEvent:
-			stopTimer(timeout)
-		case <-c:
+		case <-s.writeDeadline.Done():
 			return 0, errors.WithStack(errTimeout)
 		case <-s.chSocketWriteError:
-			stopTimer(timeout)
 			return 0, s.socketWriteError.Load().(error)
 		case <-s.die:
-			stopTimer(timeout)
 			return 0, errors.WithStack(io.ErrClosedPipe)
 		}
 	}
+}
+
+// Write implements net.Conn
+func (s *UDPSession) Write(b []byte) (n int, err error) { return s.WriteBuffers([][]byte{b}) }
+
+// writeWait paces outgoing bytes against the configured rate bucket.
+// The data is already in KCP and accounted for when this runs; only the
+// wait is left.
+func (s *UDPSession) writeWait(n int) {
+	bucket := s.bucket.Load()
+	if bucket == nil {
+		return
+	}
+
+	bucket.Wait(int64(n))
+}
+
+// acquireWriteGate serializes non-empty writes while allowing a blocked caller
+// to observe its deadline, socket errors, and session closure.
+func (s *UDPSession) acquireWriteGate() error {
+	select {
+	case <-s.writeGate:
+		return nil
+	default:
+	}
+	return s.waitWriteGate()
+}
+
+// waitWriteGate handles the contended gate path, including deadline updates
+// signaled through chWriteEvent.
+func (s *UDPSession) waitWriteGate() error {
+	for {
+		select {
+		case <-s.chWriteEvent:
+		case <-s.writeGate:
+			return nil
+		case <-s.writeDeadline.Done():
+			return errors.WithStack(errTimeout)
+		case <-s.chSocketWriteError:
+			return s.socketWriteError.Load().(error)
+		case <-s.die:
+			return errors.WithStack(io.ErrClosedPipe)
+		}
+	}
+}
+
+// releaseWriteGate makes the session available to the next waiting writer.
+func (s *UDPSession) releaseWriteGate() {
+	s.writeGate <- struct{}{}
 }
 
 func (s *UDPSession) isClosed() bool {
@@ -406,38 +521,42 @@ func (s *UDPSession) isClosed() bool {
 
 // Close closes the connection.
 func (s *UDPSession) Close() error {
+	var retErr error
 	var once bool
 	s.dieOnce.Do(func() {
-		close(s.die)
 		once = true
-	})
 
+		// try best to send all queued messages especially the data in txqueue
+		s.mu.Lock()
+		s.kcp.flush((IKCP_FLUSH_FULL))
+		close(s.die)
+		s.mu.Unlock()
+
+		s.ppSendMu.Lock()
+		s.ppClosing = true
+		s.ppSendMu.Unlock()
+
+		DefaultSnmp.decreaseCurrEstab()
+		s.callReadNotify()
+		s.discardPostProcess()
+
+		if s.l != nil { // belongs to listener
+			s.l.closeSession(s.remote)
+			return
+		}
+
+		if pp, ok := s.conn.(PacketPusher); ok {
+			pp.SetPacketReceiver(nil)
+		}
+
+		if s.ownConn { // client socket close
+			retErr = s.conn.Close()
+		}
+	})
 	if !once {
 		return errors.WithStack(io.ErrClosedPipe)
 	}
-
-	atomic.AddUint64(&DefaultSnmp.CurrEstab, ^uint64(0))
-	s.callReadNotify()
-
-	// try best to send all queued messages especially the data in txqueue
-	s.mu.Lock()
-	s.kcp.flush((IKCP_FLUSH_FULL))
-	s.mu.Unlock()
-
-	if s.l != nil { // belongs to listener
-		s.l.closeSession(s.remote)
-		return nil
-	}
-
-	if pp, ok := s.conn.(PacketPusher); ok {
-		pp.SetPacketReceiver(nil)
-	}
-
-	if s.ownConn { // client socket close
-		return s.conn.Close()
-	}
-
-	return nil
+	return retErr
 }
 
 // LocalAddr returns the local network address. The Addr returned is shared by all invocations of LocalAddr, so do not modify it.
@@ -446,46 +565,43 @@ func (s *UDPSession) LocalAddr() net.Addr { return s.conn.LocalAddr() }
 // RemoteAddr returns the remote network address. The Addr returned is shared by all invocations of RemoteAddr, so do not modify it.
 func (s *UDPSession) RemoteAddr() net.Addr { return s.remote }
 
-// SetDeadline sets the deadline associated with the listener. A zero time value disables the deadline.
+// SetDeadline sets the session's read and write deadlines. A zero time value
+// disables the deadlines.
 func (s *UDPSession) SetDeadline(t time.Time) error {
-	s.rd.Store(t)
-	s.wd.Store(t)
-	s.notifyReadEvent()
-	s.notifyWriteEvent()
+	s.SetReadDeadline(t)
+	s.SetWriteDeadline(t)
 	return nil
 }
 
 // SetReadDeadline implements the Conn SetReadDeadline method.
 func (s *UDPSession) SetReadDeadline(t time.Time) error {
-	s.rd.Store(t)
-	s.notifyReadEvent()
+	s.readDeadline.Set(t)
 	return nil
 }
 
 // SetWriteDeadline implements the Conn SetWriteDeadline method.
 func (s *UDPSession) SetWriteDeadline(t time.Time) error {
-	s.wd.Store(t)
-	s.notifyWriteEvent()
+	s.writeDeadline.Set(t)
 	return nil
 }
 
-// SetWriteDelay delays write for bulk transfer until the next update interval
+// SetWriteDelay delays writes during bulk transfer until the next update interval.
 func (s *UDPSession) SetWriteDelay(delay bool) {
 	s.mu.Lock()
 	s.writeDelay = delay
 	s.mu.Unlock()
 }
 
-// SetWindowSize set maximum window size
+// SetWindowSize sets the maximum window sizes.
 func (s *UDPSession) SetWindowSize(sndwnd, rcvwnd int) {
 	s.mu.Lock()
 	s.kcp.WndSize(sndwnd, rcvwnd)
 	s.mu.Unlock()
 }
 
-// SetMtu sets the maximum transmission unit(not including UDP header)
+// SetMtu sets the maximum transmission unit, excluding the UDP header.
 func (s *UDPSession) SetMtu(mtu int) bool {
-	mtu = min(mtuLimit, mtu)
+	mtu = min(maxPacketSize, mtu)
 
 	mtu -= s.headerSize
 	if aead, ok := s.block.(*aeadCrypt); ok {
@@ -509,7 +625,7 @@ func (s *UDPSession) SetStreamMode(enable bool) {
 	s.mu.Unlock()
 }
 
-// SetACKNoDelay changes ack flush option, set true to flush ack immediately,
+// SetACKNoDelay controls ACK flushing. When true, ACKs are flushed immediately.
 func (s *UDPSession) SetACKNoDelay(nodelay bool) {
 	s.mu.Lock()
 	s.ackNoDelay = nodelay
@@ -518,14 +634,14 @@ func (s *UDPSession) SetACKNoDelay(nodelay bool) {
 
 // (deprecated)
 //
-// SetDUP duplicates udp packets for kcp output.
+// SetDUP duplicates UDP packets sent by KCP.
 func (s *UDPSession) SetDUP(dup int) {
 	s.mu.Lock()
 	s.dup = dup
 	s.mu.Unlock()
 }
 
-// SetNoDelay calls nodelay() of kcp
+// SetNoDelay sets the KCP no-delay options.
 // https://github.com/skywind3000/kcp/blob/master/README.en.md#protocol-configuration
 func (s *UDPSession) SetNoDelay(nodelay, interval, resend, nc int) {
 	s.mu.Lock()
@@ -533,10 +649,11 @@ func (s *UDPSession) SetNoDelay(nodelay, interval, resend, nc int) {
 	s.mu.Unlock()
 }
 
-// SetDSCP sets the 6bit DSCP field in IPv4 header, or 8bit Traffic Class in IPv6 header.
+// SetDSCP sets the 6-bit DSCP field in the IPv4 header or the 6-bit Traffic
+// Class field in the IPv6 header.
 //
-// if the underlying connection has implemented `func SetDSCP(int) error`, SetDSCP() will invoke
-// this function instead.
+// If the underlying connection implements `SetDSCP(int) error`, SetDSCP invokes
+// that method instead.
 //
 // It has no effect if it's accepted from Listener.
 func (s *UDPSession) SetDSCP(dscp int) error {
@@ -552,11 +669,13 @@ func (s *UDPSession) SetDSCP(dscp int) error {
 	}
 
 	if nc, ok := s.conn.(net.Conn); ok {
+		val := dscp << 2
+
 		var succeed bool
-		if err := ipv4.NewConn(nc).SetTOS(dscp << 2); err == nil {
+		if err := ipv4.NewConn(nc).SetTOS(val); err == nil {
 			succeed = true
 		}
-		if err := ipv6.NewConn(nc).SetTrafficClass(dscp); err == nil {
+		if err := ipv6.NewConn(nc).SetTrafficClass(val); err == nil {
 			succeed = true
 		}
 
@@ -591,25 +710,33 @@ func (s *UDPSession) SetWriteBuffer(bytes int) error {
 	return errInvalidOperation
 }
 
-// SetRateLimit sets the rate limit for this session in bytes per second,
-// by setting to 0 will disable rate limiting.
-func (s *UDPSession) SetRateLimit(bytesPerSecond uint32) {
-	var limiter *rate.Limiter
-	if bytesPerSecond == 0 {
-		limiter = rate.NewLimiter(rate.Inf, maxBatchSize*mtuLimit)
-	} else {
-		limiter = rate.NewLimiter(rate.Limit(bytesPerSecond), maxBatchSize*mtuLimit)
+// SetRateLimit limits the rate at which Write and WriteBuffers accept
+// application bytes. Protocol overhead, retransmissions, and SendOOB traffic
+// are not counted. A value of 0 disables rate limiting.
+func (s *UDPSession) SetRateLimit(bps uint32) {
+	var bucket *ratelimit.Bucket
+	if bps > 0 {
+		bucket = ratelimit.NewBucketWithRate(float64(bps), int64(bps))
 	}
 
-	s.rateLimiter.Store(limiter)
+	s.bucket.Store(bucket)
+}
+
+// SetBucket limits the rate at which Write and WriteBuffers accept
+// application bytes. Protocol overhead, retransmissions, and SendOOB traffic
+// are not counted. A value of nil disables rate limiting.
+func (s *UDPSession) SetBucket(bucket *ratelimit.Bucket) {
+	s.bucket.Store(bucket)
 }
 
 // SetLogger configures the kcp trace logger
 func (s *UDPSession) SetLogger(mask KCPLogType, logger logoutput_callback) {
+	s.mu.Lock()
 	s.kcp.SetLogger(mask, logger)
+	s.mu.Unlock()
 }
 
-// Control applys a procedure to the underly socket fd.
+// Control applies a function to the underlying packet connection.
 // CAUTION: BE VERY CAREFUL TO USE THIS FUNCTION, YOU MAY BREAK THE PROTOCOL.
 func (s *UDPSession) Control(f func(conn net.PacketConn) error) error {
 	if !s.ownConn {
@@ -627,17 +754,14 @@ func (s *UDPSession) Control(f func(conn net.PacketConn) error) error {
 //  2. Encryption     — AEAD (e.g. AES-GCM) or CFB mode with CRC32
 //  3. TX batching    — accumulate packets and flush via sendmmsg/writev
 //
-// Pipeline: KCP output -> chPostProcessing -> [FEC] -> [Encrypt] -> TxQueue -> Network
+// Pipeline: KCP output -> postQueue -> [FEC] -> [Encrypt] -> TxQueue -> Network
 //
-// It returns once the queue is empty, after ppBudget packets, or when s keeps
-// a batch for the rate limiter, and reports whether s needs serving again.
-func (s *UDPSession) postProcess(w *ppWorker) bool {
+// It returns once the queue is empty or after ppBudget packets.
+func (s *UDPSession) postProcess(w *ppWorker) (more bool) {
 	bytesToSend := 0
-	for n := 0; n < ppBudget; n++ {
-		var req sendRequest
-		select {
-		case req = <-s.chPostProcessing: // dequeue from post processing
-		default:
+	for range ppBudget {
+		req, ok := s.postQueue.pop()
+		if !ok {
 			return false
 		}
 		buf := req.buffer
@@ -719,8 +843,8 @@ func (s *UDPSession) postProcess(w *ppWorker) bool {
 			w.txqueue = append(w.txqueue, msg)
 		}
 
-		// transmit when chPostProcessing is empty or we've reached max batch size
-		if len(s.chPostProcessing) == 0 || len(w.txqueue) >= maxBatchSize {
+		// transmit when postQueue is empty or we've reached max batch size
+		if s.postQueue.len() == 0 || len(w.txqueue) >= maxBatchSize {
 			if s.flushTx(w, bytesToSend) {
 				return true
 			}
@@ -730,10 +854,10 @@ func (s *UDPSession) postProcess(w *ppWorker) bool {
 	if len(w.txqueue) > 0 && s.flushTx(w, bytesToSend) {
 		return true
 	}
-	return len(s.chPostProcessing) > 0
+	return s.postQueue.len() > 0
 }
 
-// sess update to trigger protocol
+// update advances the KCP protocol state.
 func (s *UDPSession) update() {
 	select {
 	case <-s.die:
@@ -754,24 +878,24 @@ func (s *UDPSession) update() {
 	}
 }
 
-// GetConv gets conversation id of a session
+// GetConv returns the session's conversation ID.
 func (s *UDPSession) GetConv() uint32 { return s.kcp.conv }
 
-// GetRTO gets current rto of the session
+// GetRTO returns the session's current RTO.
 func (s *UDPSession) GetRTO() uint32 {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return s.kcp.rx_rto
 }
 
-// GetSRTT gets current srtt of the session
+// GetSRTT returns the session's current smoothed RTT.
 func (s *UDPSession) GetSRTT() int32 {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return s.kcp.rx_srtt
 }
 
-// GetRTTVar gets current rtt variance of the session
+// GetSRTTVar returns the session's current RTT variance.
 func (s *UDPSession) GetSRTTVar() int32 {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -813,7 +937,10 @@ func (s *UDPSession) GetOOBMaxSize() int {
 		return 0
 	}
 	// Packet layout: | conv (4B) | OOB payload |
-	return int(s.kcp.mtu) - convSize
+	s.mu.Lock()
+	size := int(s.kcp.mtu) - convSize
+	s.mu.Unlock()
+	return size
 }
 
 // SendOOB sends an out-of-band (OOB) data packet.
@@ -856,19 +983,20 @@ func (s *UDPSession) SendOOB(data []byte) error {
 	// Enqueue the packet for post-processing.
 	// Performs OOB framing, encryption, and transmission, bypassing FEC and KCP.
 	select {
-	case s.chPostProcessing <- sendRequest{buf, true}:
-		s.kickPostProcess()
-		return nil
 	case <-s.die:
 		// Session is closing.
 		defaultBufferPool.Put(buf)
 		return errors.WithStack(io.ErrClosedPipe)
 	default:
+	}
+	if s.postQueue.push(sendRequest{buf, true}) {
+		s.kickPostProcess()
+	} else {
 		// Drop silently to avoid blocking the sender.
 		// OOB delivery is best-effort by design.
 		defaultBufferPool.Put(buf)
-		return nil
 	}
+	return nil
 }
 
 func (s *UDPSession) notifyReadEvent() {
@@ -906,9 +1034,10 @@ func (s *UDPSession) notifyWriteError(err error) {
 // -----------------------------------------------------------------------
 
 // packetInput is the entry point for incoming packets.
-// It handles decryption and CRC32 verification before passing data to kcpInput.
+// It handles decryption and integrity verification before passing data to
+// kcpInput. CFB mode uses CRC32; AEAD mode verifies its authentication tag.
 //
-// Pipeline: Network -> [Decrypt] -> [CRC32] -> kcpInput
+// Pipeline: Network -> [Decrypt and verify] -> kcpInput
 func (s *UDPSession) packetInput(data []byte) {
 	switch block := s.block.(type) {
 	case nil:
@@ -923,7 +1052,7 @@ func (s *UDPSession) packetInput(data []byte) {
 
 		plaintext, err := block.Open(ciphertext[:0], nonce, ciphertext, nil)
 		if err != nil {
-			atomic.AddUint64(&DefaultSnmp.InCsumErrors, 1)
+			DefaultSnmp.increaseInCsumErrors()
 			return
 		}
 
@@ -939,7 +1068,7 @@ func (s *UDPSession) packetInput(data []byte) {
 
 		checksum := crc32.ChecksumIEEE(data[crcSize:])
 		if checksum != binary.LittleEndian.Uint32(data) {
-			atomic.AddUint64(&DefaultSnmp.InCsumErrors, 1)
+			DefaultSnmp.increaseInCsumErrors()
 			return
 		}
 
@@ -949,7 +1078,7 @@ func (s *UDPSession) packetInput(data []byte) {
 	// basic check for minimum packet size
 	// NOTE: OOB allows sending small packets and even empty packets.
 	if len(data) < min(IKCP_OVERHEAD, fecHeaderSizePlus2+convSize) {
-		atomic.AddUint64(&DefaultSnmp.KCPInErrors, 1)
+		DefaultSnmp.addKCPInErrors(1)
 		return
 	}
 
@@ -967,16 +1096,17 @@ func (s *UDPSession) packetInput(data []byte) {
 // Note: KCP cmd values [81-84] with frg [0-255] do not collide with
 // FEC type markers 0x00f1/0x00f2/0x00f3 in little-endian.
 func (s *UDPSession) kcpInput(data []byte) {
-	atomic.AddUint64(&DefaultSnmp.InPkts, 1)
-	atomic.AddUint64(&DefaultSnmp.InBytes, uint64(len(data)))
+	DefaultSnmp.increaseInPkts()
+	DefaultSnmp.addInBytes(len(data))
 
-	// 16bit kcp cmd [81-84] and frg [0-255] will not overlap with FEC type 0x00f1 0x00f2
+	// The 16-bit KCP cmd/frg field (cmd 81-84, frg 0-255) cannot match the FEC
+	// type markers 0x00f1-0x00f3.
 	fecFlag := binary.LittleEndian.Uint16(data[4:])
 
 	switch fecFlag {
 	case typeData, typeParity: // packet with FEC
 		if len(data) < fecHeaderSizePlus2 {
-			atomic.AddUint64(&DefaultSnmp.InErrs, 1)
+			DefaultSnmp.increaseInErrs()
 			return
 		}
 
@@ -1003,10 +1133,10 @@ func (s *UDPSession) kcpInput(data []byte) {
 		}
 
 		// FEC decoding
-		// If there're some packets recovered from FEC, feed them into kcp
+		// If any packets were recovered by FEC, feed them into KCP.
 		recovers := s.fecDecoder.decode(f)
 		for _, r := range recovers {
-			if len(r) >= 2 { // must be larger than 2bytes
+			if len(r) >= 2 { // Must be at least 2 bytes.
 				sz := binary.LittleEndian.Uint16(r)
 				if int(sz) <= len(r) && sz >= 2 {
 					if ret := s.kcp.Input(r[2:sz], IKCP_PACKET_FEC, s.ackNoDelay); ret != 0 {
@@ -1031,11 +1161,11 @@ func (s *UDPSession) kcpInput(data []byte) {
 		}
 
 		if kcpInErrors > 0 {
-			atomic.AddUint64(&DefaultSnmp.KCPInErrors, kcpInErrors)
+			DefaultSnmp.addKCPInErrors(kcpInErrors)
 		}
 	case typeOOB:
 		// Count received OOB packet
-		atomic.AddUint64(&DefaultSnmp.OOBPackets, 1)
+		DefaultSnmp.increaseOOBPackets()
 		// If an OOB callback is registered, invoke it synchronously.
 		// The callback is responsible for ensuring non-blocking behavior.
 		if callback := s.callbackForOOB.Load(); callback != nil {
@@ -1047,7 +1177,7 @@ func (s *UDPSession) kcpInput(data []byte) {
 		defer s.mu.Unlock()
 
 		if ret := s.kcp.Input(data, IKCP_PACKET_REGULAR, s.ackNoDelay); ret != 0 {
-			atomic.AddUint64(&DefaultSnmp.KCPInErrors, 1)
+			DefaultSnmp.addKCPInErrors(1)
 		}
 
 		if n := s.kcp.PeekSize(); n > 0 {
@@ -1062,16 +1192,31 @@ func (s *UDPSession) kcpInput(data []byte) {
 	}
 }
 
+// ResetRTO resets the retransmission timers for all pending segments.
+//
+// This method does not trigger a synchronous flush. Retransmission will
+// naturally occur at the next background update tick, governed by the
+// `interval` configured via SetNoDelay (default 100ms).
+//
+// It is intended for cases where the application knows connectivity
+// has been restored and wants to resume data delivery without waiting
+// for existing retransmission timers to expire.
+func (s *UDPSession) ResetRTO() {
+	s.mu.Lock()
+	s.kcp.ResetRTO()
+	s.mu.Unlock()
+}
+
 // -----------------------------------------------------------------------
 // Listener: server-side session multiplexer
 // -----------------------------------------------------------------------
 
 type (
-	// Listener defines a server which will be waiting to accept incoming connections
+	// Listener accepts incoming connections.
 	Listener struct {
 		block        BlockCrypt     // block encryption
-		dataShards   int            // FEC data shard
-		parityShards int            // FEC parity shard
+		dataShards   int            // number of FEC data shards
+		parityShards int            // number of FEC parity shards
 		conn         net.PacketConn // the underlying packet connection
 		ownConn      bool           // true if we created conn internally, false if provided by caller
 
@@ -1087,7 +1232,7 @@ type (
 		chSocketReadError   chan struct{}
 		socketReadErrorOnce sync.Once
 
-		rd atomic.Value // read deadline for Accept()
+		acceptDeadline *deadline.Deadline
 	}
 )
 
@@ -1108,7 +1253,7 @@ func (l *Listener) packetInput(data []byte, addr net.Addr) {
 
 		plaintext, err := block.Open(ciphertext[:0], nonce, ciphertext, nil)
 		if err != nil {
-			atomic.AddUint64(&DefaultSnmp.InCsumErrors, 1)
+			DefaultSnmp.increaseInCsumErrors()
 			return
 		}
 
@@ -1124,7 +1269,7 @@ func (l *Listener) packetInput(data []byte, addr net.Addr) {
 
 		checksum := crc32.ChecksumIEEE(data[crcSize:])
 		if checksum != binary.LittleEndian.Uint32(data) {
-			atomic.AddUint64(&DefaultSnmp.InCsumErrors, 1)
+			DefaultSnmp.increaseInCsumErrors()
 			return
 		}
 
@@ -1146,7 +1291,8 @@ func (l *Listener) packetInput(data []byte, addr net.Addr) {
 	hasConv := false
 
 	// try to get conversation id from the packet
-	// 16bit kcp cmd [81-84] and frg [0-255] will not overlap with FEC type 0x00f1 0x00f2
+	// The 16-bit KCP cmd/frg field (cmd 81-84, frg 0-255) cannot match the FEC
+	// type markers 0x00f1-0x00f3.
 	fecFlag := binary.LittleEndian.Uint16(data[4:])
 
 	switch fecFlag {
@@ -1209,6 +1355,13 @@ func (l *Listener) packetInput(data []byte, addr net.Addr) {
 	s = newUDPSession(conv, l.dataShards, l.parityShards, l, l.conn, false, addr, l.block)
 	s.kcpInput(data)
 	l.sessionLock.Lock()
+	select {
+	case <-l.die:
+		l.sessionLock.Unlock()
+		s.Close()
+		return
+	default:
+	}
 	l.sessions[addr.String()] = s
 	l.sessionLock.Unlock()
 	l.chAccepts <- s
@@ -1244,10 +1397,11 @@ func (l *Listener) SetWriteBuffer(bytes int) error {
 	return errInvalidOperation
 }
 
-// SetDSCP sets the 6bit DSCP field in IPv4 header, or 8bit Traffic Class in IPv6 header.
+// SetDSCP sets the 6-bit DSCP field in the IPv4 header or the 6-bit Traffic
+// Class field in the IPv6 header.
 //
-// if the underlying connection has implemented `func SetDSCP(int) error`, SetDSCP() will invoke
-// this function instead.
+// If the underlying connection implements `SetDSCP(int) error`, SetDSCP invokes
+// that method instead.
 func (l *Listener) SetDSCP(dscp int) error {
 	// interface enabled
 	if conn, ok := l.conn.(setDSCP); ok {
@@ -1259,12 +1413,13 @@ func (l *Listener) SetDSCP(dscp int) error {
 		return errInvalidOperation
 	}
 
+	val := dscp << 2
 	var succeed bool
-	if err := ipv4.NewConn(conn).SetTOS(dscp << 2); err == nil {
+	if err := ipv4.NewConn(conn).SetTOS(val); err == nil {
 		succeed = true
 	}
 
-	if err := ipv6.NewConn(conn).SetTrafficClass(dscp); err == nil {
+	if err := ipv6.NewConn(conn).SetTrafficClass(val); err == nil {
 		succeed = true
 	}
 
@@ -1275,23 +1430,15 @@ func (l *Listener) SetDSCP(dscp int) error {
 	return errInvalidOperation
 }
 
-// Accept implements the Accept method in the Listener interface; it waits for the next call and returns a generic Conn.
+// Accept waits for and returns the next connection as a net.Conn.
 func (l *Listener) Accept() (net.Conn, error) {
 	return l.AcceptKCP()
 }
 
 // AcceptKCP accepts a KCP connection
 func (l *Listener) AcceptKCP() (*UDPSession, error) {
-	var timeout <-chan time.Time
-	if tdeadline, ok := l.rd.Load().(time.Time); ok && !tdeadline.IsZero() {
-		timer := time.NewTimer(time.Until(tdeadline))
-		defer timer.Stop()
-
-		timeout = timer.C
-	}
-
 	select {
-	case <-timeout:
+	case <-l.acceptDeadline.Done():
 		return nil, errors.WithStack(errTimeout)
 	case c := <-l.chAccepts:
 		return c, nil
@@ -1304,14 +1451,12 @@ func (l *Listener) AcceptKCP() (*UDPSession, error) {
 
 // SetDeadline sets the deadline associated with the listener. A zero time value disables the deadline.
 func (l *Listener) SetDeadline(t time.Time) error {
-	l.SetReadDeadline(t)
-	l.SetWriteDeadline(t)
-	return nil
+	return l.SetReadDeadline(t)
 }
 
 // SetReadDeadline implements the Conn SetReadDeadline method.
 func (l *Listener) SetReadDeadline(t time.Time) error {
-	l.rd.Store(t)
+	l.acceptDeadline.Set(t)
 	return nil
 }
 
@@ -1320,21 +1465,26 @@ func (l *Listener) SetWriteDeadline(t time.Time) error {
 	return errInvalidOperation
 }
 
-// Close stops listening on the UDP address, and closes the socket
+// Close stops listening on the UDP address and closes the socket if the
+// Listener owns it.
 func (l *Listener) Close() error {
 	var once bool
+	l.sessionLock.Lock()
 	l.dieOnce.Do(func() {
 		close(l.die)
 		once = true
 	})
 
 	if !once {
+		l.sessionLock.Unlock()
 		return errors.WithStack(io.ErrClosedPipe)
 	}
 
-	l.sessionLock.Lock()
-	l.releasePusherLocked()
+	pp := l.releasePusherLocked()
 	l.sessionLock.Unlock()
+	if pp != nil {
+		pp.SetPacketReceiver(nil)
+	}
 
 	if l.ownConn {
 		return l.conn.Close()
@@ -1343,7 +1493,7 @@ func (l *Listener) Close() error {
 	return nil
 }
 
-// Control applys a procedure to the underly socket fd.
+// Control applies a function to the underlying packet connection.
 // CAUTION: BE VERY CAREFUL TO USE THIS FUNCTION, YOU MAY BREAK THE PROTOCOL.
 func (l *Listener) Control(f func(conn net.PacketConn) error) error {
 	l.sessionLock.Lock()
@@ -1352,36 +1502,42 @@ func (l *Listener) Control(f func(conn net.PacketConn) error) error {
 	return f(l.conn)
 }
 
-// closeSession notify the listener that a session has closed
+// closeSession notifies the listener that a session has closed.
 func (l *Listener) closeSession(remote net.Addr) (ret bool) {
 	l.sessionLock.Lock()
-	defer l.sessionLock.Unlock()
-
 	if _, ok := l.sessions[remote.String()]; ok {
 		delete(l.sessions, remote.String())
-		l.releasePusherLocked()
+		pp := l.releasePusherLocked()
+		l.sessionLock.Unlock()
+		if pp != nil {
+			pp.SetPacketReceiver(nil)
+		}
 		return true
 	}
+	l.sessionLock.Unlock()
 	return false
 }
 
 // releasePusherLocked removes the PacketPusher receiver once the Listener is
-// closed and its last session has gone. sessionLock must be held.
-func (l *Listener) releasePusherLocked() {
+// closed and its last session has gone. sessionLock must be held. The caller
+// must unregister the returned pusher after releasing sessionLock.
+func (l *Listener) releasePusherLocked() PacketPusher {
 	select {
 	case <-l.die:
 	default:
-		return
+		return nil
 	}
 	if len(l.sessions) > 0 {
-		return
+		return nil
 	}
 	if pp, ok := l.conn.(PacketPusher); ok {
-		pp.SetPacketReceiver(nil)
+		return pp
 	}
+	return nil
 }
 
-// Addr returns the listener's network address, The Addr returned is shared by all invocations of Addr, so do not modify it.
+// Addr returns the listener's network address. The returned address is shared
+// by all invocations of Addr, so do not modify it.
 func (l *Listener) Addr() net.Addr {
 	return l.conn.LocalAddr()
 }
@@ -1395,13 +1551,15 @@ func Listen(laddr string) (net.Listener, error) {
 	return ListenWithOptions(laddr, nil, 0, 0)
 }
 
-// ListenWithOptions listens for incoming KCP packets addressed to the local address laddr on the network "udp" with packet encryption.
+// ListenWithOptions listens for incoming KCP packets addressed to laddr on
+// the "udp" network, with optional packet encryption and FEC.
 //
 // 'block' is the block encryption algorithm to encrypt packets.
 //
-// 'dataShards', 'parityShards' specify how many parity packets will be generated following the data packets.
+// dataShards and parityShards specify the numbers of data and parity shards,
+// respectively.
 //
-// Check https://github.com/klauspost/reedsolomon for details
+// See https://github.com/klauspost/reedsolomon for details.
 func ListenWithOptions(laddr string, block BlockCrypt, dataShards, parityShards int) (*Listener, error) {
 	udpaddr, err := net.ResolveUDPAddr("udp", laddr)
 	if err != nil {
@@ -1416,7 +1574,7 @@ func ListenWithOptions(laddr string, block BlockCrypt, dataShards, parityShards 
 	return serveConn(block, dataShards, parityShards, conn, true)
 }
 
-// ServeConn serves KCP protocol for a single packet connection.
+// ServeConn serves the KCP protocol over a single packet connection.
 func ServeConn(block BlockCrypt, dataShards, parityShards int, conn net.PacketConn) (*Listener, error) {
 	return serveConn(block, dataShards, parityShards, conn, false)
 }
@@ -1432,6 +1590,12 @@ func serveConn(block BlockCrypt, dataShards, parityShards int, conn net.PacketCo
 	l.parityShards = parityShards
 	l.block = block
 	l.chSocketReadError = make(chan struct{})
+
+	l.acceptDeadline = deadline.New()
+
+	// Stop the Accept deadline timer when the listener is closed.
+	runtime.AddCleanup(l, freeDeadline, l.acceptDeadline)
+
 	if pp, ok := conn.(PacketPusher); ok {
 		pp.SetPacketReceiver(l.pushedPacket)
 	} else {
@@ -1445,13 +1609,15 @@ func Dial(raddr string) (net.Conn, error) {
 	return DialWithOptions(raddr, nil, 0, 0)
 }
 
-// DialWithOptions connects to the remote address "raddr" on the network "udp" with packet encryption
+// DialWithOptions connects to raddr on the "udp" network, with optional packet
+// encryption and FEC.
 //
 // 'block' is the block encryption algorithm to encrypt packets.
 //
-// 'dataShards', 'parityShards' specify how many parity packets will be generated following the data packets.
+// dataShards and parityShards specify the numbers of data and parity shards,
+// respectively.
 //
-// Check https://github.com/klauspost/reedsolomon for details
+// See https://github.com/klauspost/reedsolomon for details.
 func DialWithOptions(raddr string, block BlockCrypt, dataShards, parityShards int) (*UDPSession, error) {
 	// network type detection
 	udpaddr, err := net.ResolveUDPAddr("udp", raddr)
@@ -1474,55 +1640,30 @@ func DialWithOptions(raddr string, block BlockCrypt, dataShards, parityShards in
 	return newUDPSession(convid, dataShards, parityShards, nil, conn, true, udpaddr, block), nil
 }
 
-// NewConn4 establishes a session and talks KCP protocol over a packet connection.
+// NewConn4 establishes a session that speaks KCP over a packet connection.
 func NewConn4(convid uint32, raddr net.Addr, block BlockCrypt, dataShards, parityShards int, ownConn bool, conn net.PacketConn) (*UDPSession, error) {
 	return newUDPSession(convid, dataShards, parityShards, nil, conn, ownConn, raddr, block), nil
 }
 
-// NewConn3 establishes a session and talks KCP protocol over a packet connection.
+// NewConn3 establishes a session that speaks KCP over a packet connection.
 func NewConn3(convid uint32, raddr net.Addr, block BlockCrypt, dataShards, parityShards int, conn net.PacketConn) (*UDPSession, error) {
 	return newUDPSession(convid, dataShards, parityShards, nil, conn, false, raddr, block), nil
 }
 
-// NewConn2 establishes a session and talks KCP protocol over a packet connection.
+// NewConn2 establishes a session that speaks KCP over a packet connection.
 func NewConn2(raddr net.Addr, block BlockCrypt, dataShards, parityShards int, conn net.PacketConn) (*UDPSession, error) {
 	var convid uint32
 	binary.Read(rand.Reader, binary.LittleEndian, &convid)
 	return NewConn3(convid, raddr, block, dataShards, parityShards, conn)
 }
 
-// NewConn establishes a session and talks KCP protocol over a packet connection.
+// NewConn establishes a session that speaks KCP over a packet connection.
 func NewConn(raddr string, block BlockCrypt, dataShards, parityShards int, conn net.PacketConn) (*UDPSession, error) {
 	udpaddr, err := net.ResolveUDPAddr("udp", raddr)
 	if err != nil {
 		return nil, errors.WithStack(err)
 	}
 	return NewConn2(udpaddr, block, dataShards, parityShards, conn)
-}
-
-// armDeadline starts or resets t for the deadline held in v, just before a
-// blocking wait, and returns its channel. It returns nil without a deadline.
-func armDeadline(t **time.Timer, v *atomic.Value) <-chan time.Time {
-	d, ok := v.Load().(time.Time)
-	if !ok || d.IsZero() {
-		return nil
-	}
-	if *t == nil {
-		*t = time.NewTimer(time.Until(d))
-	} else {
-		(*t).Reset(time.Until(d))
-	}
-	return (*t).C
-}
-
-// stopTimer stops t, if armed, and drains a fire it may have left.
-func stopTimer(t *time.Timer) {
-	if t != nil && !t.Stop() {
-		select {
-		case <-t.C:
-		default:
-		}
-	}
 }
 
 // buffersEmpty reports whether v holds no bytes.
@@ -1535,55 +1676,21 @@ func buffersEmpty(v [][]byte) bool {
 	return true
 }
 
-// readLocked copies data that is ready into b and reports whether there was
-// any. It must be called with s.mu held.
-func (s *UDPSession) readLocked(b []byte) (int, bool) {
-	// bufptr points to the current position of recvbuf,
-	// if previous 'b' is insufficient to accommodate the data, the
-	// remaining data will be stored in bufptr for next read.
-	if len(s.bufptr) > 0 {
-		n := copy(b, s.bufptr)
-		s.bufptr = s.bufptr[n:]
-		return n, true
+func (s *UDPSession) notifyReadIfAvailableLocked() {
+	if s.input.Len() > 0 || s.kcp.PeekSize() > 0 {
+		s.notifyReadEvent()
 	}
-
-	size := s.kcp.PeekSize() // peek data size from kcp
-	if size <= 0 {
-		return 0, false
-	}
-	// if 'b' is large enough to accommodate the data, read directly
-	// from kcp.recv() to 'b', like 'DMA'.
-	if len(b) >= size {
-		s.kcp.Recv(b)
-		return size, true
-	}
-
-	// otherwise, read to recvbuf first, then copy to 'b'.
-	// dynamically adjust the buffer size to the maximum of 'packet size' when necessary.
-	if cap(s.recvbuf) < size {
-		// usually recvbuf has a size of maximum packet size
-		s.recvbuf = make([]byte, size)
-	}
-
-	// resize the length of recvbuf to match the data size
-	s.recvbuf = s.recvbuf[:size]
-	s.kcp.Recv(s.recvbuf)    // read data to recvbuf first
-	n := copy(b, s.recvbuf)  // then copy bytes to 'b' as many as possible
-	s.bufptr = s.recvbuf[n:] // pointer update
-	return n, true
 }
 
 // TryRead is Read without waiting. It returns 0 and no error when no data is
 // ready, and the session's error once it is closed or its socket failed and
 // no data is left.
 func (s *UDPSession) TryRead(b []byte) (int, error) {
-	s.mu.Lock()
-	n, ok := s.readLocked(b)
-	s.mu.Unlock()
+	n, ok := s.read(b)
 	if ok {
-		atomic.AddUint64(&DefaultSnmp.BytesReceived, uint64(n))
 		return n, nil
 	}
+
 	select {
 	case <-s.chSocketReadError:
 		return 0, s.socketReadError.Load().(error)

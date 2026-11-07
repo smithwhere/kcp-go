@@ -1,3 +1,25 @@
+// The MIT License (MIT)
+//
+// Copyright (c) 2015 xtaci
+//
+// Permission is hereby granted, free of charge, to any person obtaining a copy
+// of this software and associated documentation files (the "Software"), to deal
+// in the Software without restriction, including without limitation the rights
+// to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+// copies of the Software, and to permit persons to whom the Software is
+// furnished to do so, subject to the following conditions:
+//
+// The above copyright notice and this permission notice shall be included in all
+// copies or substantial portions of the Software.
+//
+// THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+// IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+// FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+// AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+// LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+// OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+// SOFTWARE.
+
 package kcp
 
 import (
@@ -25,7 +47,11 @@ func TestTryReadWithNotify(t *testing.T) {
 	})
 
 	want := bytes.Repeat([]byte("0123456789abcdef"), 4096)
-	go func() { _, _ = sess.Write(want) }()
+	writeDone := make(chan error, 1)
+	go func() {
+		_, err := sess.Write(want)
+		writeDone <- err
+	}()
 
 	var got []byte
 	buf := make([]byte, 1500)
@@ -48,6 +74,9 @@ func TestTryReadWithNotify(t *testing.T) {
 	if !bytes.Equal(got, want) {
 		t.Fatal("echo mismatch")
 	}
+	if err := <-writeDone; err != nil {
+		t.Fatal(err)
+	}
 
 	sess.Close()
 	select {
@@ -58,5 +87,49 @@ func TestTryReadWithNotify(t *testing.T) {
 	// Either the close itself or the closed socket's read error.
 	if _, err := sess.TryRead(buf); err == nil {
 		t.Fatalf("TryRead after Close: %v", err)
+	}
+}
+
+func TestConcurrentReadersNotifiedForBufferedData(t *testing.T) {
+	s := &UDPSession{
+		die:               make(chan struct{}),
+		chReadEvent:       make(chan struct{}, 1),
+		chSocketReadError: make(chan struct{}),
+		kcp:               NewKCP(1, nil),
+	}
+	s.input.Reset([]byte("ab"))
+	defer close(s.die)
+
+	type result struct {
+		value byte
+		err   error
+	}
+	results := make(chan result, 2)
+	start := make(chan struct{})
+	for range 2 {
+		go func() {
+			<-start
+			var b [1]byte
+			_, err := s.Read(b[:])
+			results <- result{value: b[0], err: err}
+		}()
+	}
+	close(start)
+	s.notifyReadEvent()
+
+	var seen [256]bool
+	for range 2 {
+		select {
+		case r := <-results:
+			if r.err != nil {
+				t.Fatal(r.err)
+			}
+			seen[r.value] = true
+		case <-time.After(time.Second):
+			t.Fatal("a reader remained blocked while buffered data was available")
+		}
+	}
+	if !seen['a'] || !seen['b'] {
+		t.Fatalf("read bytes a=%t b=%t, want both", seen['a'], seen['b'])
 	}
 }

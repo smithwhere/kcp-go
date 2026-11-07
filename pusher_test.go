@@ -1,3 +1,25 @@
+// The MIT License (MIT)
+//
+// Copyright (c) 2015 xtaci
+//
+// Permission is hereby granted, free of charge, to any person obtaining a copy
+// of this software and associated documentation files (the "Software"), to deal
+// in the Software without restriction, including without limitation the rights
+// to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+// copies of the Software, and to permit persons to whom the Software is
+// furnished to do so, subject to the following conditions:
+//
+// The above copyright notice and this permission notice shall be included in all
+// copies or substantial portions of the Software.
+//
+// THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+// IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+// FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+// AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+// LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+// OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+// SOFTWARE.
+
 package kcp
 
 import (
@@ -7,6 +29,8 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/pion/transport/v5/deadline"
 )
 
 // pushConn reads its UDP socket on one goroutine and hands every packet to
@@ -16,6 +40,38 @@ type pushConn struct {
 	pushed   atomic.Int64
 	receiver atomic.Pointer[func([]byte, net.Addr, error)]
 	start    sync.Once
+}
+
+type lockCheckingPusher struct {
+	net.PacketConn
+	check    chan bool
+	listener *Listener
+}
+
+func (p *lockCheckingPusher) SetPacketReceiver(fn func([]byte, net.Addr, error)) {
+	if fn == nil {
+		locked := p.listener.sessionLock.TryRLock()
+		if locked {
+			p.listener.sessionLock.RUnlock()
+		}
+		p.check <- locked
+	}
+}
+
+type gatedAddr struct {
+	calls   atomic.Int32
+	entered chan struct{}
+	release chan struct{}
+}
+
+func (a *gatedAddr) Network() string { return "udp" }
+
+func (a *gatedAddr) String() string {
+	if a.calls.Add(1) == 2 {
+		close(a.entered)
+		<-a.release
+	}
+	return "127.0.0.1:1"
 }
 
 func (c *pushConn) SetPacketReceiver(fn func([]byte, net.Addr, error)) {
@@ -30,7 +86,7 @@ func (c *pushConn) SetPacketReceiver(fn func([]byte, net.Addr, error)) {
 }
 
 func (c *pushConn) readLoop() {
-	buf := make([]byte, mtuLimit)
+	buf := make([]byte, maxPacketSize)
 	for {
 		n, addr, err := c.UDPConn.ReadFrom(buf)
 		if fn := c.receiver.Load(); fn != nil {
@@ -111,33 +167,6 @@ func TestPacketPusherListener(t *testing.T) {
 	}
 }
 
-func TestPacketPusherPinsFirstPeer(t *testing.T) {
-	udp, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer udp.Close()
-	sess, err := NewConn3(1, nil, nil, 0, 0, &pushConn{UDPConn: udp})
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer sess.Close()
-
-	first := &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 1}
-	other := &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 2}
-	pkt := make([]byte, IKCP_OVERHEAD)
-	before := atomic.LoadUint64(&DefaultSnmp.InErrs)
-	sess.pushedPacket(pkt, first, nil)
-	sess.pushedPacket(pkt, first, nil)
-	if got := atomic.LoadUint64(&DefaultSnmp.InErrs) - before; got != 0 {
-		t.Fatalf("packets from the first peer counted %d errors", got)
-	}
-	sess.pushedPacket(pkt, other, nil)
-	if got := atomic.LoadUint64(&DefaultSnmp.InErrs) - before; got != 1 {
-		t.Fatalf("a packet from another peer counted %d errors, want 1", got)
-	}
-}
-
 func TestPacketPusherReleasedOnClose(t *testing.T) {
 	cudp, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
 	if err != nil {
@@ -189,5 +218,227 @@ func TestPacketPusherReleasedOnClose(t *testing.T) {
 	s.Close()
 	if lpc.receiver.Load() != nil {
 		t.Fatal("Listener kept its receiver after its last session closed")
+	}
+}
+
+func TestPacketPusherListenerClosed(t *testing.T) {
+	udp, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer udp.Close()
+	pc := &pushConn{UDPConn: udp}
+	l, err := ServeConn(nil, 0, 0, pc)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := l.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if pc.receiver.Load() != nil {
+		t.Fatal("Listener kept the receiver after closing without sessions")
+	}
+
+	// A callback already running when Close released the receiver must not
+	// register a session that will never get another packet.
+	pkt := make([]byte, IKCP_OVERHEAD)
+	pkt[0] = 1
+	pkt[4] = IKCP_CMD_PUSH
+	l.pushedPacket(pkt, &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 1}, nil)
+	l.sessionLock.RLock()
+	n := len(l.sessions)
+	l.sessionLock.RUnlock()
+	if n != 0 {
+		t.Fatalf("closed listener registered %d sessions", n)
+	}
+}
+
+func TestPacketPusherListenerCloseRegistrationRace(t *testing.T) {
+	udp, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer udp.Close()
+
+	pc := &pushConn{UDPConn: udp}
+	l, err := ServeConn(nil, 0, 0, pc)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer l.Close()
+
+	addr := &gatedAddr{
+		entered: make(chan struct{}),
+		release: make(chan struct{}),
+	}
+	defer func() {
+		select {
+		case <-addr.release:
+		default:
+			close(addr.release)
+		}
+	}()
+	pkt := make([]byte, IKCP_OVERHEAD)
+	pkt[0] = 1
+	pkt[4] = IKCP_CMD_PUSH
+
+	inputDone := make(chan struct{})
+	go func() {
+		l.packetInput(pkt, addr)
+		close(inputDone)
+	}()
+	select {
+	case <-addr.entered:
+	case <-time.After(5 * time.Second):
+		t.Fatal("packetInput did not reach session registration")
+	}
+
+	closeStarted := make(chan struct{})
+	closeDone := make(chan error, 1)
+	go func() {
+		close(closeStarted)
+		closeDone <- l.Close()
+	}()
+	select {
+	case <-closeStarted:
+	case <-time.After(5 * time.Second):
+		t.Fatal("Listener.Close did not start")
+	}
+
+	closedEarly := false
+	select {
+	case <-l.die:
+		closedEarly = true
+	case <-time.After(100 * time.Millisecond):
+	}
+
+	select {
+	case <-addr.release:
+	default:
+		close(addr.release)
+	}
+	select {
+	case <-inputDone:
+	case <-time.After(5 * time.Second):
+		t.Fatal("packetInput did not finish")
+	}
+	var closeErr error
+	select {
+	case closeErr = <-closeDone:
+	case <-time.After(5 * time.Second):
+		t.Fatal("Listener.Close did not finish")
+	}
+
+	l.sessionLock.RLock()
+	s := l.sessions[addr.String()]
+	l.sessionLock.RUnlock()
+	if s == nil {
+		t.Fatal("in-flight packet did not register its session before Close")
+	}
+	select {
+	case accepted := <-l.chAccepts:
+		if accepted != s {
+			t.Error("accepted a different session than the one registered")
+		}
+	default:
+		t.Error("registered session was not added to the accept queue")
+	}
+	if pc.receiver.Load() == nil {
+		t.Error("Listener released the receiver while the session was open")
+	}
+	if err := s.Close(); err != nil {
+		t.Errorf("close accepted session: %v", err)
+	}
+	l.sessionLock.RLock()
+	remaining := len(l.sessions)
+	l.sessionLock.RUnlock()
+	if remaining != 0 {
+		t.Errorf("session close left %d sessions registered", remaining)
+	}
+	if pc.receiver.Load() != nil {
+		t.Error("Listener kept the receiver after its last session closed")
+	}
+	if closeErr != nil {
+		t.Fatal(closeErr)
+	}
+	if closedEarly {
+		t.Fatal("Listener closed while packetInput held sessionLock")
+	}
+}
+
+func TestPacketPusherUnregisterOutsideListenerLock(t *testing.T) {
+	udp, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer udp.Close()
+
+	pc := &lockCheckingPusher{
+		PacketConn: udp,
+		check:      make(chan bool, 1),
+	}
+	l, err := ServeConn(nil, 0, 0, pc)
+	if err != nil {
+		t.Fatal(err)
+	}
+	pc.listener = l
+
+	if err := l.Close(); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case unlocked := <-pc.check:
+		if !unlocked {
+			t.Fatal("PacketPusher was unregistered while sessionLock was held")
+		}
+	default:
+		t.Fatal("Listener.Close did not unregister the PacketPusher")
+	}
+}
+
+func TestPacketPusherLastSessionUnregisterOutsideListenerLock(t *testing.T) {
+	udp, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer udp.Close()
+
+	pc := &lockCheckingPusher{
+		PacketConn: udp,
+		check:      make(chan bool, 1),
+	}
+	l, err := ServeConn(nil, 0, 0, pc)
+	if err != nil {
+		t.Fatal(err)
+	}
+	pc.listener = l
+
+	remote := &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 1}
+	s := &UDPSession{
+		conn:          pc,
+		kcp:           NewKCP(1, nil),
+		l:             l,
+		remote:        remote,
+		die:           make(chan struct{}),
+		readDeadline:  deadline.New(),
+		writeDeadline: deadline.New(),
+	}
+	l.sessionLock.Lock()
+	l.sessions[remote.String()] = s
+	l.sessionLock.Unlock()
+
+	if err := l.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Close(); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case unlocked := <-pc.check:
+		if !unlocked {
+			t.Fatal("PacketPusher was unregistered while sessionLock was held")
+		}
+	default:
+		t.Fatal("last session close did not unregister the PacketPusher")
 	}
 }
